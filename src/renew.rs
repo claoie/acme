@@ -32,7 +32,7 @@ pub fn due(now: i64, not_before: i64, not_after: i64, renew_before_expiry: Optio
         return true;
     }
     if let Some(before) = renew_before_expiry {
-        return not_after < now + before;
+        return not_after < now.saturating_add(before);
     }
     if ari_time.is_none() {
         let lifetime = not_after - not_before;
@@ -374,6 +374,11 @@ mod tests {
     fn renew_before_expiry_wins_over_the_lifetime() {
         assert!(due(10 * DAY, 0, 90 * DAY, Some(85 * DAY), None));
         assert!(!due(70 * DAY, 0, 90 * DAY, Some(10 * DAY), None));
+    }
+
+    #[test]
+    fn a_huge_renew_before_expiry_means_due_rather_than_overflow() {
+        assert!(due(70 * DAY, 0, 90 * DAY, Some(i64::MAX - DAY), None));
     }
 
     #[test]

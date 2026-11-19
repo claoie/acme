@@ -9,8 +9,10 @@
 //! never finds a missing link or links into two different versions.
 
 use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+use std::ops::Bound;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
 use std::path::{Component, Path, PathBuf};
 
@@ -35,6 +37,7 @@ pub struct Lineage {
     pub archive_dir: PathBuf,
     pub live_dir: PathBuf,
     links: [PathBuf; 4],
+    link_files: [OsString; 4],
 }
 
 impl Lineage {
@@ -50,6 +53,10 @@ impl Lineage {
         let links = match links {
             [Some(a), Some(b), Some(c), Some(d)] => [a, b, c, d],
             _ => bail!("the renewal file needs all of cert, privkey, chain and fullchain"),
+        };
+        let link_files = match links.each_ref().map(|l| l.file_name().map(OsStr::to_os_string)) {
+            [Some(a), Some(b), Some(c), Some(d)] => [a, b, c, d],
+            _ => bail!("cert, privkey, chain and fullchain must each name a file"),
         };
         let live_dir = links[0]
             .parent()
@@ -74,11 +81,17 @@ impl Lineage {
             archive_dir,
             live_dir,
             links,
+            link_files,
         })
     }
 
     fn link(&self, kind: &str) -> &Path {
-        &self.links[KINDS.iter().position(|k| *k == kind).expect("a known kind")]
+        &self.links[kind_index(kind)]
+    }
+
+    /// The link's file name, such as `fullchain.pem`.
+    fn link_file(&self, kind: &str) -> &OsStr {
+        &self.link_files[kind_index(kind)]
     }
 
     /// The version `live/` points at. All four links must agree.
@@ -146,7 +159,10 @@ impl Lineage {
                 }
             }
         }
-        for (version, files) in self.archive_versions()?.range(current + 1..) {
+        for (version, files) in self
+            .archive_versions()?
+            .range((Bound::Excluded(current), Bound::Unbounded))
+        {
             warning!(
                 "{}: removing version {version}, which an interrupted run wrote but never linked",
                 self.name
@@ -162,7 +178,12 @@ impl Lineage {
     /// file fails, the ones written are removed again.
     pub fn save(&self, cert: &str, chain: &str, key: &str, prior: Option<u32>) -> Result<u32> {
         fs::create_dir_all(&self.archive_dir)?;
-        let version = self.archive_versions()?.keys().next_back().map_or(1, |v| v + 1);
+        let version = match self.archive_versions()?.keys().next_back() {
+            None => 1,
+            Some(&last) => last
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("version {last} in the archive is the last a version number can hold"))?,
+        };
         let (key_mode, key_gid) = match prior {
             Some(prior) => {
                 let old = fs::metadata(self.archive_dir.join(format!("privkey{prior}.pem")))
@@ -233,7 +254,7 @@ impl Lineage {
                 .unwrap_or_else(|| fallback_dir.clone());
             symlink(
                 dir.join(format!("{kind}{version}.pem")),
-                staging.join(link.file_name().expect("a file")),
+                staging.join(self.link_file(kind)),
             )?;
         }
         let readme = self.live_dir.join("README");
@@ -259,7 +280,7 @@ impl Lineage {
                         self.name
                     );
                     for kind in KINDS {
-                        let file = self.link(kind).file_name().expect("a file");
+                        let file = self.link_file(kind);
                         fs::rename(staging.join(file), self.live_dir.join(file))?;
                     }
                     remove_dir_tree(&staging)?;
@@ -309,6 +330,10 @@ fn lineage_name(conf_path: &Path) -> Result<String> {
     file.strip_suffix(".conf")
         .map(str::to_owned)
         .ok_or_else(|| anyhow!("{} is not a .conf file", conf_path.display()))
+}
+
+fn kind_index(kind: &str) -> usize {
+    KINDS.iter().position(|k| *k == kind).expect("one of KINDS")
 }
 
 /// `cert12.pem` is version 12 of `cert`.
@@ -622,6 +647,59 @@ mod tests {
                 & 0o777,
             0o600
         );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Points every live link of lineage `name` at `version`, with archive files for it.
+    fn relink(root: &Path, name: &str, version: u32) {
+        for kind in KINDS {
+            fs::write(
+                root.join(format!("archive/{name}/{kind}{version}.pem")),
+                format!("{kind} {version}\n"),
+            )
+            .unwrap();
+            let link = root.join(format!("live/{name}/{kind}.pem"));
+            fs::remove_file(&link).unwrap();
+            symlink(format!("../../archive/{name}/{kind}{version}.pem"), &link).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_last_version_number_neither_wraps_nor_cleans_up_the_archive() {
+        let root = temp_dir("last-version");
+        let lineage = certbot_lineage(&root, "last");
+        relink(&root, "last", u32::MAX);
+        assert_eq!(lineage.current_version().unwrap(), u32::MAX);
+        lineage.clean_up(u32::MAX).unwrap();
+        assert!(
+            root.join("archive/last/cert1.pem").exists(),
+            "clean-up removed an older version"
+        );
+        assert!(root.join(format!("archive/last/cert{}.pem", u32::MAX)).exists());
+        let err = lineage
+            .save("c\n", "ch\n", "k\n", Some(u32::MAX))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the last a version number can hold"), "{err}");
+        assert!(
+            !root.join("archive/last/cert0.pem").exists(),
+            "save wrapped to version 0"
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_link_path_that_names_no_file_is_refused_on_load() {
+        let root = temp_dir("no-file");
+        fs::create_dir_all(root.join("renewal")).unwrap();
+        let conf = root.join("renewal/bad.conf");
+        let mut text = format!("archive_dir = {}\n", root.join("archive/bad").display());
+        for kind in KINDS {
+            text.push_str(&format!("{kind} = {}\n", root.join("live/bad/..").display()));
+        }
+        fs::write(&conf, text).unwrap();
+        let err = Lineage::load(&conf).err().expect("load refuses it").to_string();
+        assert!(err.contains("must each name a file"), "{err}");
         fs::remove_dir_all(&root).unwrap();
     }
 

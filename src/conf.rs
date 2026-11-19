@@ -134,7 +134,9 @@ pub fn interval_seconds(value: &str) -> Result<i64> {
         "week" => 7 * 86_400,
         _ => bail!("{value:?} is not an interval such as \"30 days\""),
     };
-    Ok(number * unit)
+    number
+        .checked_mul(unit)
+        .ok_or_else(|| anyhow!("{value:?} is too long an interval"))
 }
 
 /// A new lineage's renewal file, in the shape certbot writes.
@@ -250,6 +252,18 @@ ari_retry_after = 2026-11-19T06:00:00
         assert_eq!(boolean(Some("True")).unwrap(), Some(true));
         assert_eq!(boolean(Some("False")).unwrap(), Some(false));
         assert!(boolean(Some("maybe")).is_err());
+    }
+
+    #[test]
+    fn an_interval_too_long_to_count_is_refused() {
+        for value in ["9223372036854775807 days", "106751991167301 days"] {
+            let err = interval_seconds(value).unwrap_err().to_string();
+            assert!(err.contains("too long"), "{err}");
+        }
+        assert_eq!(
+            interval_seconds("106751991167300 days").unwrap(),
+            106_751_991_167_300 * 86_400
+        );
     }
 
     #[test]

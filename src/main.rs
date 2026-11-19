@@ -47,7 +47,7 @@ enum Command {
     Run {
         #[command(flatten)]
         renew: RenewArgs,
-        /// Time between passes: a number followed by s, m, h or d.
+        /// Time between passes: a positive number followed by s, m, h or d.
         #[arg(long, default_value = "12h", value_parser = parse_interval)]
         interval: Duration,
     },
@@ -97,14 +97,18 @@ fn parse_interval(value: &str) -> Result<Duration, String> {
     let number: u64 = number
         .parse()
         .map_err(|_| format!("{value:?} is not like 30s, 10m, 12h or 1d"))?;
-    let seconds = match unit {
-        "s" => number,
-        "m" => number * 60,
-        "h" => number * 3600,
-        "d" => number * 86_400,
+    let unit: u64 = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
         _ => return Err(format!("{value:?} is not like 30s, 10m, 12h or 1d")),
     };
-    Ok(Duration::from_secs(seconds))
+    match number.checked_mul(unit) {
+        Some(0) => Err(format!("{value:?} would run the passes back to back: use 1s or more")),
+        Some(seconds) => Ok(Duration::from_secs(seconds)),
+        None => Err(format!("{value:?} is too long an interval")),
+    }
 }
 
 fn main() -> ExitCode {
@@ -267,6 +271,20 @@ mod tests {
         assert_eq!(parse_interval("1d").unwrap(), Duration::from_secs(86_400));
         assert!(parse_interval("12").is_err());
         assert!(parse_interval("h").is_err());
+    }
+
+    #[test]
+    fn intervals_that_would_loop_without_waiting_are_refused() {
+        for value in ["0s", "0h"] {
+            assert!(parse_interval(value).unwrap_err().contains("back to back"));
+        }
+        for value in ["18446744073709551615h", "213503982334602d"] {
+            assert!(parse_interval(value).unwrap_err().contains("too long"));
+        }
+        assert_eq!(
+            parse_interval("213503982334601d").unwrap(),
+            Duration::from_secs(213_503_982_334_601 * 86_400)
+        );
         assert_eq!(humanize(Duration::from_secs(43_200)), "12h");
     }
 }
